@@ -2,7 +2,7 @@ name: fix_asset_check
 description: "A new Flutter project."
 publish_to: 'none'
 
-version: 1.0.0+1
+version: 1.0.2+1
 
 environment:
   sdk: ^3.9.2
@@ -21,6 +21,14 @@ dev_dependencies:
     sdk: flutter
 
   flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.13.1
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/icon/
+
+flutter_icons:
+  android: true
+  ios: false
+  image_path: assets/icon/app_icon.png

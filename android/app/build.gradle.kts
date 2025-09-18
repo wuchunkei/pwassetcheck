@@ -1,3 +1,9 @@
+// 将 app 模块的构建目录重定向到无空格路径，规避 Windows 路径空格问题
+val appNoSpaceBuildDir = file("C:/AndroidBuilds/FixAssetCheck/app/build")
+layout.buildDirectory.set(appNoSpaceBuildDir)
+@Suppress("UnstableApiUsage")
+buildDir = appNoSpaceBuildDir
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
@@ -35,6 +41,19 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            ndk {
+                debugSymbolLevel = "none"
+            }
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // Keep debug symbols in native libraries to avoid strip failures during AAB build
+            keepDebugSymbols.add("**/*.so")
+            // Additionally, skip stripping entirely to bypass missing strip tool in environment
+            @Suppress("UnstableApiUsage")
+            doNotStrip.add("**/*.so")
         }
     }
 }

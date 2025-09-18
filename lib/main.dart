@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:mongo_dart/mongo_dart.dart' as mongo;
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:flutter/services.dart';
+import 'dart:async';
 
 void main() {
   runApp(const MyApp());
@@ -51,7 +52,16 @@ class _LoginPageState extends State<LoginPage> {
   static const _kCandidateDbsKey = 'candidateDbs';
   static const _kSuccessfulDbsKey = 'successfulDbs';
   static const String kFixedMongoBaseUri =
-      '//'; // redacted for public repo
+      'mongodb+srv://wuchunkei:FoGGy20021109!@picturemap.ef0ym3m.mongodb.net/?retryWrites=true&w=majority&appName=PictureMap';   
+  // 新增：會話時間戳記與最大時長（24 小時）
+  static const String _kSessionLoginAt = 'sessionLoginAt';
+  static const int _kSessionMaxAgeHours = 24;
+
+  @override
+  void initState() {
+    super.initState();
+    _bootstrap();
+  }
 
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
@@ -69,10 +79,34 @@ class _LoginPageState extends State<LoginPage> {
     });
   }
 
-  @override
-  void initState() {
-    super.initState();
-    _loadPrefs();
+  Future<void> _bootstrap() async {
+    await _loadPrefs();
+    await _tryAutoResumeSession();
+  }
+
+  Future<void> _tryAutoResumeSession() async {
+    final prefs = await SharedPreferences.getInstance();
+    final ts = prefs.getString(_kSessionLoginAt);
+    if (ts == null) return;
+    final loginAt = DateTime.tryParse(ts);
+    if (loginAt == null) return;
+
+    final now = DateTime.now().toUtc();
+    if (now.difference(loginAt.toUtc()) > const Duration(hours: _kSessionMaxAgeHours)) return;
+
+    final available = prefs.getStringList(_kSuccessfulDbsKey) ?? <String>[];
+    if (available.isEmpty) return;
+    final preferred = prefs.getString('preferredDb');
+    final initSel = (preferred != null && available.contains(preferred)) ? preferred : available.first;
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => HomePage(
+          availableDatabases: available,
+          initialSelection: initSel,
+        ),
+      ),
+    );
   }
 
   @override
@@ -301,14 +335,14 @@ Future<void> _onLogin() async {
       try {
         // 使用 Db.create 以支援 mongodb+srv 的 SRV 解析
         db = await mongo.Db.create(uri);
-        await db.open();
+        await db.open().timeout(const Duration(seconds: 6));
 
         // 確保預設帳號存在
         // read-only: skip default user bootstrap
         // await _ensureDefaultUser(db);
 
         final users = db.collection('users');
-        final userDoc = await users.findOne({'username': username});
+        final userDoc = await users.findOne({'username': username}).timeout(const Duration(seconds: 3));
         if (userDoc != null && (userDoc['password']?.toString() ?? '') == password) {
           // 記錄此庫成功
           matchedDbs.add(dbName);
@@ -349,6 +383,8 @@ Future<void> _onLogin() async {
 
     // 更新快取成功的資料庫清單
     await prefs.setStringList(_kSuccessfulDbsKey, matchedDbs);
+    // 記錄本地會話啟動時間（UTC），供 24 小時內自動登入與到期自動登出
+    await prefs.setString(_kSessionLoginAt, DateTime.now().toUtc().toIso8601String());
 
     // 顯示上次登入時間資訊（若有）
     if (!mounted) return;
@@ -515,30 +551,39 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   late String _selectedDb;
 
   static const _kSuccessfulDbsKey = 'successfulDbs';
   static const _kPreferredDbKey = 'preferredDb';
   static const _kScanHistoryKey = 'scanHistory';
+  // 新增：每筆掃描對應的資料庫名稱，與 _scanHistory 等長
+  static const _kScanHistoryDbKey = 'scanHistoryDb';
   List<String> _scanHistory = [];
+  List<String> _scanHistoryDb = [];
 
   // 內嵌掃描器（首頁直接掃描）
   final MobileScannerController _homeScanner = MobileScannerController(
-    detectionSpeed: DetectionSpeed.noDuplicates,
+    detectionSpeed: DetectionSpeed.normal,
     facing: CameraFacing.back,
     torchEnabled: false,
     formats: [BarcodeFormat.all],
   );
   String? _lastCodeHome;
   bool _handlingScan = false;
-
-  // 查詢結果快取：以掃描到的字串為 key，對應到在 fix_asset_list 查到的文件（若無則為 null）
-  final Map<String, Map<String, dynamic>?> _assetByCode = {};
+  // 針對首頁掃描：記錄各代碼最後處理時間，允許短冷卻後再次掃描
+  final Map<String, DateTime> _homeLastHandledAt = {};
+  // 查詢結果快取（依資料庫分區），避免跨資料庫顯示到其他庫的查詢結果
+  final Map<String /* db */, Map<String /* code */, Map<String, dynamic>?>> _assetByDb = {};
+  // 新增：會話到期檢查
+  static const String _kSessionLoginAt = 'sessionLoginAt';
+  static const int _kSessionMaxAgeHours = 24;
+  Timer? _sessionExpireTimer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // 以登入流程傳入的初始資料庫作為預設值，避免 LateInitializationError
     _selectedDb = widget.initialSelection;
     // 載入掃描記錄
@@ -547,10 +592,77 @@ class _HomePageState extends State<HomePage> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _loadPreferredDbIfAny();
     });
+    // 啟動會話到期計時
+    _setupSessionExpiry();
+  }
+
+  // 新增：設置或重設會話到期計時器
+  Future<void> _setupSessionExpiry() async {
+    final prefs = await SharedPreferences.getInstance();
+    final ts = prefs.getString(_kSessionLoginAt);
+    if (ts == null) return;
+    final loginAt = DateTime.tryParse(ts);
+    if (loginAt == null) return;
+    final now = DateTime.now().toUtc();
+    final elapsed = now.difference(loginAt.toUtc());
+    final maxAge = Duration(hours: _kSessionMaxAgeHours);
+    final remain = maxAge - elapsed;
+    if (remain <= Duration.zero) {
+      if (mounted) _logout();
+      return;
+    }
+    _sessionExpireTimer?.cancel();
+    _sessionExpireTimer = Timer(remain, () {
+      if (mounted) {
+        _logout();
+      }
+    });
+  }
+
+  // 新增：前台時再次校驗是否已過期
+  Future<void> _enforceSessionValidOnResume() async {
+    final prefs = await SharedPreferences.getInstance();
+    final ts = prefs.getString(_kSessionLoginAt);
+    if (ts == null) return;
+    final loginAt = DateTime.tryParse(ts);
+    if (loginAt == null) return;
+    if (DateTime.now().toUtc().difference(loginAt.toUtc()) > Duration(hours: _kSessionMaxAgeHours)) {
+      if (mounted) _logout();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _enforceSessionValidOnResume();
+    }
+  }
+
+  @override
+  void dispose() {
+    _sessionExpireTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
   }
 
   // 使用已存在的固定集群連線字串（與登入頁相同，用於查詢）
   static const String _kFixedBaseUriForQuery = _LoginPageState.kFixedMongoBaseUri;
+
+  // 新增：格式化資料庫名稱供 UI 顯示（去除開頭的 "pw" 與結尾的 "asset"，其餘轉成大寫）
+  String _formatDbDisplay(String db) {
+    var start = 0;
+    var end = db.length;
+    final lower = db.toLowerCase();
+    if (lower.startsWith('pw')) {
+      start = 2;
+    }
+    if (lower.endsWith('asset')) {
+      end -= 5;
+    }
+    if (start >= end) return db.toUpperCase();
+    final core = db.substring(start, end);
+    return core.toUpperCase();
+  }
 
   // 將資料庫名稱附加到完整連線字串
   String _appendDbToMongoUriForQuery(String fullBaseUri, String dbName) {
@@ -638,8 +750,11 @@ class _HomePageState extends State<HomePage> {
     if (barcodes.isEmpty) return;
     final code = barcodes.first.rawValue;
     if (code == null || code.isEmpty) return;
-    if (code == _lastCodeHome) return;
-    _lastCodeHome = code;
+    // 避免永久性去重，改為短冷卻：同一代碼 2 秒內不重複觸發
+    final now = DateTime.now();
+    final last = _homeLastHandledAt[code];
+    if (last != null && now.difference(last) < const Duration(seconds: 2)) return;
+    _homeLastHandledAt[code] = now;
 
     _handlingScan = true;
     await _addScanResult(code);
@@ -650,7 +765,15 @@ class _HomePageState extends State<HomePage> {
   Future<void> _loadScanHistory() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      _scanHistory = prefs.getStringList(_kScanHistoryKey) ?? [];
+      final list = prefs.getStringList(_kScanHistoryKey) ?? [];
+      _scanHistory = list;
+      final dblist = prefs.getStringList(_kScanHistoryDbKey);
+      if (dblist != null && dblist.length == list.length) {
+        _scanHistoryDb = dblist;
+      } else {
+        // 若無舊資料或長度不一致，預設填目前選擇的 DB
+        _scanHistoryDb = List<String>.filled(list.length, _selectedDb);
+      }
     });
   }
 
@@ -658,28 +781,35 @@ class _HomePageState extends State<HomePage> {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _scanHistory = [..._scanHistory, code];
+      _scanHistoryDb = [..._scanHistoryDb, _selectedDb];
     });
     await prefs.setStringList(_kScanHistoryKey, _scanHistory);
-
+    await prefs.setStringList(_kScanHistoryDbKey, _scanHistoryDb);
+ 
     // 立即針對該掃描值查詢目前所選資料庫
     final data = await _fetchAssetByScannedCode(code);
     if (!mounted) return;
     setState(() {
-      _assetByCode[code] = data;
+      final currentDbMap = Map<String, Map<String, dynamic>?>.from(_assetByDb[_selectedDb] ?? {});
+      currentDbMap[code] = data;
+      _assetByDb[_selectedDb] = currentDbMap;
     });
-
     final found = data != null;
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(found ? '已找到對應項：$code' : '未在 $_selectedDb 找到對應項：$code')),
+      SnackBar(content: Text(found ? '已找到對應項：$code' : '未在 ${_formatDbDisplay(_selectedDb)} 找到對應項：$code')),
     );
   }
 
   Future<void> _clearScanHistory() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_kScanHistoryKey);
+    await prefs.remove(_kScanHistoryDbKey);
     if (!mounted) return;
-    setState(() => _scanHistory = []);
+    setState(() {
+      _scanHistory = [];
+      _scanHistoryDb = [];
+    });
   }
 
   Future<void> _loadPreferredDbIfAny() async {
@@ -715,6 +845,8 @@ class _HomePageState extends State<HomePage> {
     // 清理成功資料庫快取即可，帳密是否保留交由使用者的 Remember 選項控制
     await prefs.remove('successfulDbs');
     await prefs.remove('preferredDb');
+    await prefs.remove('sessionLoginAt');
+    _sessionExpireTimer?.cancel();
     if (!mounted) return;
     Navigator.of(context).pushAndRemoveUntil(
       MaterialPageRoute(builder: (_) => const LoginPage()),
@@ -746,7 +878,7 @@ class _HomePageState extends State<HomePage> {
                     items: widget.availableDatabases
                         .map((db) => DropdownMenuItem<String>(
                               value: db,
-                              child: Text(db),
+                              child: Text(_formatDbDisplay(db)),
                             ))
                         .toList(),
                     onChanged: (v) {
@@ -830,8 +962,12 @@ class _HomePageState extends State<HomePage> {
                       separatorBuilder: (_, __) => const SizedBox(height: 8),
                       itemBuilder: (context, index) {
                         // 最新在最前面（反向索引）
-                        final code = _scanHistory[_scanHistory.length - 1 - index];
-                        final data = _assetByCode[code];
+                        final codeIndex = _scanHistory.length - 1 - index;
+                        final code = _scanHistory[codeIndex];
+                        final dbForEntry = (_scanHistoryDb.length == _scanHistory.length)
+                            ? _scanHistoryDb[codeIndex]
+                            : _selectedDb; // 後備：若資料不一致，就以當前 DB 顯示
+                        final data = _assetByDb[dbForEntry]?[code];
                         final idText = data != null ? _formatId(data['_id']) : code;
                         final from = data == null ? '-' : (data['From']?.toString() ?? '-');
                         final to = data == null ? '-' : (data['To']?.toString() ?? '-');
@@ -843,6 +979,9 @@ class _HomePageState extends State<HomePage> {
                         final receiverStr = data == null ? '-' : (data['receiver']?.toString() ?? '-');
                         final details = data == null ? '-' : (data['Details']?.toString() ?? '-');
                         final tag = data == null ? '-' : (data['Tag']?.toString() ?? '-');
+                        // disposal 標紅（不分大小寫）
+                        final isDisposal = tag.toLowerCase().contains('disposal');
+                        final tagColor = isDisposal ? Colors.red : Colors.white;
                         return Align(
                           alignment: Alignment.centerLeft,
                           child: Container(
@@ -855,13 +994,32 @@ class _HomePageState extends State<HomePage> {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Text(
-                                  'ID: $idText',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.w600,
-                                  ),
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.start,
+                                  crossAxisAlignment: CrossAxisAlignment.center,
+                                  children: [
+                                    Text(
+                                      'ID: $idText',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                      decoration: BoxDecoration(
+                                        color: Colors.white24,
+                                        borderRadius: BorderRadius.circular(10),
+                                        border: Border.all(color: Colors.white30, width: 1),
+                                      ),
+                                      child: Text(
+                                        _formatDbDisplay(dbForEntry),
+                                        style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
+                                      ),
+                                    ),
+                                  ],
                                 ),
                                 const SizedBox(height: 6),
                                 Text('From: $from', style: const TextStyle(color: Colors.white, fontSize: 14)),
@@ -873,7 +1031,7 @@ class _HomePageState extends State<HomePage> {
                                 Text('operator: $operatorStr', style: const TextStyle(color: Colors.white, fontSize: 14)),
                                 Text('receiver: $receiverStr', style: const TextStyle(color: Colors.white, fontSize: 14)),
                                 Text('Details: $details', style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                Text('Tag: $tag', style: const TextStyle(color: Colors.white, fontSize: 14)),
+                                Text('Tag: $tag', style: TextStyle(color: tagColor, fontSize: 14)),
                               ],
                             ),
                           ),
@@ -907,14 +1065,14 @@ class BarcodeScannerPage extends StatefulWidget {
 
 class _BarcodeScannerPageState extends State<BarcodeScannerPage> {
   final MobileScannerController _controller = MobileScannerController(
-    detectionSpeed: DetectionSpeed.noDuplicates,
+    detectionSpeed: DetectionSpeed.normal,
     facing: CameraFacing.back,
     torchEnabled: false,
     formats: [BarcodeFormat.all],
   );
 
-  String? _lastCode;
   bool _handling = false;
+  DateTime? _lastDetectAt;
 
   @override
   void dispose() {
@@ -924,12 +1082,16 @@ class _BarcodeScannerPageState extends State<BarcodeScannerPage> {
 
   void _onDetected(BarcodeCapture capture) async {
     if (_handling) return;
+    // 簡單時間窗抑制，避免快速抖動導致多次觸發
+    final now = DateTime.now();
+    if (_lastDetectAt != null && now.difference(_lastDetectAt!) < const Duration(milliseconds: 800)) {
+      return;
+    }
+    _lastDetectAt = now;
     final barcodes = capture.barcodes;
     if (barcodes.isEmpty) return;
     final code = barcodes.first.rawValue;
     if (code == null || code.isEmpty) return;
-    if (code == _lastCode) return; // ignore duplicates
-    _lastCode = code;
 
     _handling = true;
     if (!mounted) return;
