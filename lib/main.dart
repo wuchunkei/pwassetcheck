@@ -329,43 +329,46 @@ Future<void> _onLogin() async {
     final List<String> errors = [];
     DateTime? lastLoginToShow; // 用於顯示上次登入時間（以第一個匹配到的 DB 為準）
 
-    for (final dbName in ordered) {
-      final uri = _appendDbToMongoUri(baseUri, dbName);
-      mongo.Db? db;
-      try {
-        // 使用 Db.create 以支援 mongodb+srv 的 SRV 解析
-        db = await mongo.Db.create(uri);
-        await db.open().timeout(const Duration(seconds: 6));
+    // 將逐庫串行驗證改為分批並行驗證，提高總體速度
+    const int concurrency = 4;
+    for (int i = 0; i < ordered.length; i += concurrency) {
+      final int end = (i + concurrency < ordered.length) ? i + concurrency : ordered.length;
+      final batch = ordered.sublist(i, end);
+      final futures = batch.map((dbName) async {
+        final uri = _appendDbToMongoUri(baseUri, dbName);
+        mongo.Db? db;
+        try {
+          db = await mongo.Db.create(uri);
+          await db.open().timeout(const Duration(seconds: 6));
+          final users = db.collection('users');
+          final userDoc = await users.findOne({'username': username}).timeout(const Duration(seconds: 3));
+          if (userDoc != null && (userDoc['password']?.toString() ?? '') == password) {
+            dynamic prev = userDoc['last_login'];
+            return <String, dynamic>{'db': dbName, 'prev': prev};
+          }
+        } catch (e) {
+          debugPrint('Mongo login error on $dbName: $e');
+          errors.add('$dbName: $e');
+        } finally {
+          try { await db?.close(); } catch (_) {}
+        }
+        return null;
+      });
 
-        // 確保預設帳號存在
-        // read-only: skip default user bootstrap
-        // await _ensureDefaultUser(db);
-
-        final users = db.collection('users');
-        final userDoc = await users.findOne({'username': username}).timeout(const Duration(seconds: 3));
-        if (userDoc != null && (userDoc['password']?.toString() ?? '') == password) {
-          // 記錄此庫成功
+      final results = await Future.wait(futures);
+      for (final r in results) {
+        if (r is Map<String, dynamic>) {
+          final dbName = r['db'] as String;
           matchedDbs.add(dbName);
-
-          // 取出上次登入時間（第一個匹配成功的庫作為顯示依據）
           if (lastLoginToShow == null) {
-            final prev = userDoc['last_login'];
+            final prev = r['prev'];
             if (prev is String) {
-              try { lastLoginToShow = DateTime.tryParse(prev); } catch (_) {}
+              try { lastLoginToShow = DateTime.tryParse(prev)?.toUtc(); } catch (_) {}
             } else if (prev is DateTime) {
               lastLoginToShow = prev.toUtc();
             }
           }
-
-          // read-only: skip updating last_login
         }
-        // 更新 last_login 的寫入邏輯已移除，保持純讀取
-      } catch (e) {
-        // 記錄錯誤以便提示
-        debugPrint('Mongo login error on $dbName: $e');
-        errors.add('$dbName: $e');
-      } finally {
-        try { await db?.close(); } catch (_) {}
       }
     }
 
@@ -571,11 +574,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   );
   String? _lastCodeHome;
   bool _handlingScan = false;
-  // 針對首頁掃描：記錄各代碼最後處理時間，允許短冷卻後再次掃描
+  // against首頁掃描：記錄各代碼最後處理時間，允許短冷卻後再次掃描
   final Map<String, DateTime> _homeLastHandledAt = {};
   // 查詢結果快取（依資料庫分區），避免跨資料庫顯示到其他庫的查詢結果
   final Map<String /* db */, Map<String /* code */, Map<String, dynamic>?>> _assetByDb = {};
-  // 新增：會話到期檢查
+  // 新增：disposal 詳細資料快取（以 DB + Old Asset Code 作為 key）
+  final Map<String /* db */, Map<String /* oldAssetCode */, Map<String, dynamic>?>> _disposalByDb = {};
+  // 新增：每個條目的 chip 頁索引與拖曳距離暫存（僅 disposal 項會用到）
+  final Map<String /* code */, int> _chipPageIndexByCode = {};
+  final Map<String /* code */, double> _chipDragDxByCode = {};
+  // 新增：每個條目的 Disposal 詳情顯示切換狀態
+  final Map<String /* code */, bool> _showDisposalInfoByCode = {};
+  // 新增：每個條目的 disposal 展開狀態（供 "why disposal?" 切換）
+  final Map<String, bool> _disposalExpandedByCode = {};
+  // 新增：已建立索引的資料庫集合，避免重複建立
+  final Set<String> _indexEnsuredDbs = {};
+  // 會話到期檢查（恢復）
   static const String _kSessionLoginAt = 'sessionLoginAt';
   static const int _kSessionMaxAgeHours = 24;
   Timer? _sessionExpireTimer;
@@ -592,8 +606,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _loadPreferredDbIfAny();
     });
-    // 啟動會話到期計時
+    // 啟動會話到期計時器
     _setupSessionExpiry();
+    // 新增：啟動後為當前資料庫建立（或確認）索引，以加速查詢
+    Future.microtask(() => _ensureIndexesForDb(_selectedDb));
   }
 
   // 新增：設置或重設會話到期計時器
@@ -638,6 +654,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  // Chip UI helper：統一 chip 視覺
+  Widget _buildChip({required String label, required Color bg, required Color fg, Key? key}) {
+    return Container(
+      key: key,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: fg.withOpacity(0.4), width: 1),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.08), blurRadius: 6, offset: const Offset(0, 2)),
+        ],
+      ),
+      child: Text(label, style: TextStyle(color: fg, fontSize: 13, fontWeight: FontWeight.w600)),
+    );
+  }
+
   @override
   void dispose() {
     _sessionExpireTimer?.cancel();
@@ -673,13 +706,60 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return '$baseNoSlash/$dbName$query';
   }
 
-  // 嘗試以掃描字串從選定的資料庫查 fix_asset_list 對應文件
+  // 新增：為查詢用的欄位建立索引（若已存在則忽略錯誤）
+  Future<void> _ensureIndexesForDb(String dbName) async {
+    try {
+      final String uri = _appendDbToMongoUriForQuery(_kFixedBaseUriForQuery, dbName);
+      final mongo.Db db = await mongo.Db.create(uri);
+      await db.open();
+      final coll = db.collection('fix_asset_list');
+      final keys = ['Old Asset Code', 'New Asset Code', 'SN', 'Code', 'Asset Code'];
+      for (final k in keys) {
+        final idxName = 'idx_${k.replaceAll(' ', '_').toLowerCase()}_1';
+        try {
+          // 主要路徑：使用 collection.createIndex（若版本不支援則進入 catch）
+          await coll.createIndex(keys: {k: 1}, name: idxName, background: true);
+          debugPrint('Index ensured on $dbName: $idxName');
+        } catch (e) {
+          // 某些 driver 版本不支援以指令形式建立索引，僅記錄錯誤不阻斷
+          debugPrint('Ensure index failed on $dbName for $k: $e');
+        }
+      }
+      await db.close();
+    } catch (e) {
+      debugPrint('Ensure indexes error on $dbName: $e');
+    }
+  }
+
+  // 新增：以 Old Asset Code 從 disposal_list 查詢（指定資料庫）
+  Future<Map<String, dynamic>?> _fetchDisposalByOldAssetCode(String oldAssetCode, String dbName) async {
+    final String uri = _appendDbToMongoUriForQuery(_kFixedBaseUriForQuery, dbName);
+    mongo.Db? db;
+    try {
+      db = await mongo.Db.create(uri);
+      await db.open();
+      final coll = db.collection('disposal_list');
+      Map<String, dynamic>? doc;
+      try {
+        doc = await coll.findOne({'Old Asset Code': oldAssetCode});
+      } catch (e) {
+        debugPrint('Query disposal_list failed for "$oldAssetCode" in $dbName: $e');
+      }
+      return doc?.cast<String, dynamic>();
+    } catch (e) {
+      debugPrint('Disposal query error on $dbName: $e');
+      return null;
+    } finally {
+      try { await db?.close(); } catch (_) {}
+    }
+  }
+
+  // 還原：以掃描字串從選定的資料庫查 fix_asset_list 對應文件
   Future<Map<String, dynamic>?> _fetchAssetByScannedCode(String raw) async {
-    // 先做基本清理：去頭尾空白，並嘗試自字串中抽出第一段 24 位十六進位（若存在）
     String code = raw.trim();
     final match24 = RegExp(r'[a-fA-F0-9]{24}').firstMatch(code);
     if (match24 != null && code.length != 24) {
-      code = match24.group(0)!; // 條碼若為 "ID: <hex>" 之類，取出 <hex>
+      code = match24.group(0)!;
     }
 
     final String uri = _appendDbToMongoUriForQuery(_kFixedBaseUriForQuery, _selectedDb);
@@ -689,32 +769,62 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       await db.open();
       final coll = db.collection('fix_asset_list');
 
-      // 僅使用 ObjectId 依 _id 查詢（與實際資料類型一致）
-      if (!RegExp(r'^[a-fA-F0-9]{24}$').hasMatch(code)) {
-        debugPrint('Skip query: scanned "$raw" 不像 24 位 ObjectId（目前僅支援以 ObjectId 查詢）。');
-        return null;
+      Map<String, dynamic>? doc;
+
+      // 1) 以 ObjectId 查 _id
+      if (RegExp(r'^[a-fA-F0-9]{24}$').hasMatch(code)) {
+        try {
+          final objectId = mongo.ObjectId.fromHexString(code);
+          doc = await coll.findOne({'_id': objectId});
+          if (doc != null) {
+            debugPrint('Found by _id on $_selectedDb for ObjectId($code)');
+          }
+        } catch (e) {
+          debugPrint('Create ObjectId or query by _id failed on $_selectedDb for "$code": $e');
+        }
       }
 
-      try {
-        final objectId = mongo.ObjectId.fromHexString(code);
-        final doc = await coll.findOne({'_id': objectId});
-        if (doc != null) {
-          debugPrint('Found document on $_selectedDb for ObjectId($code)');
-          return doc.cast<String, dynamic>();
+      // 2) 等值查詢
+      if (doc == null) {
+        final keys = ['Old Asset Code', 'New Asset Code', 'SN', 'Code', 'Asset Code'];
+        final orFilters = [for (final k in keys) {k: code}];
+        try {
+          doc = await coll.findOne({'\$or': orFilters});
+          if (doc != null) {
+            debugPrint('Found by equality on $_selectedDb with keys: ${keys.join(', ')} for "$code"');
+          }
+        } catch (e) {
+          debugPrint('Equality fallback query failed on $_selectedDb for "$code": $e');
         }
-        debugPrint('No document found on $_selectedDb for ObjectId($code)');
-        return null;
-      } catch (e) {
-        debugPrint('Create ObjectId or query by ObjectId failed on $_selectedDb for "$code": $e');
-        return null;
       }
+
+      // 3) 不分大小寫精確正則
+      if (doc == null) {
+        final keys = ['Old Asset Code', 'New Asset Code', 'SN', 'Code', 'Asset Code'];
+        final esc = RegExp.escape(code);
+        final orRegex = [
+          for (final k in keys) {k: {'\$regex': '^$esc\$', '\$options': 'i'}}
+        ];
+        try {
+          doc = await coll.findOne({'\$or': orRegex});
+          if (doc != null) {
+            debugPrint('Found by regex (i) on $_selectedDb with keys: ${keys.join(', ')} for "$code"');
+          }
+        } catch (e) {
+          debugPrint('Regex fallback query failed on $_selectedDb for "$code": $e');
+        }
+      }
+
+      if (doc != null) {
+        return doc.cast<String, dynamic>();
+      }
+      debugPrint('No document found on $_selectedDb for "$code" after all strategies');
+      return null;
     } catch (e) {
       debugPrint('Query error on $_selectedDb: $e');
       return null;
     } finally {
-      try {
-        await db?.close();
-      } catch (_) {}
+      try { await db?.close(); } catch (_) {}
     }
   }
 
@@ -758,7 +868,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     _handlingScan = true;
     await _addScanResult(code);
-    await Future.delayed(const Duration(milliseconds: 600));
+    // 縮短處理延遲，加速下一次掃描
+    await Future.delayed(const Duration(milliseconds: 150));
     _handlingScan = false;
   }
 
@@ -774,6 +885,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         // 若無舊資料或長度不一致，預設填目前選擇的 DB
         _scanHistoryDb = List<String>.filled(list.length, _selectedDb);
       }
+      // 重新載入時清空每列的 chip 狀態，回到預設（Fix Asset Check）
+      _chipPageIndexByCode.clear();
+      _chipDragDxByCode.clear();
     });
   }
 
@@ -786,13 +900,46 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     await prefs.setStringList(_kScanHistoryKey, _scanHistory);
     await prefs.setStringList(_kScanHistoryDbKey, _scanHistoryDb);
  
-    // 立即針對該掃描值查詢目前所選資料庫
-    final data = await _fetchAssetByScannedCode(code);
+    // 先嘗試快取命中，若無則進行查詢
+    Map<String, dynamic>? data = _assetByDb[_selectedDb]?[code];
+    data ??= await _fetchAssetByScannedCode(code);
+
+    // 判斷是否需查 disposal_list
+    Map<String, dynamic>? disposalData;
+    if (data != null) {
+      final oldAssetCode = data['Old Asset Code']?.toString();
+      if (oldAssetCode != null && oldAssetCode.isNotEmpty && oldAssetCode != '-') {
+        final from = data['From']?.toString() ?? '';
+        final to = data['To']?.toString() ?? '';
+        final tag = data['Tag']?.toString() ?? '';
+        final details = data['Details']?.toString() ?? '';
+        bool hasDisposalKeyword(String s) {
+          final t = s.toLowerCase();
+          return t.contains('disposal') || t.contains('dispose') || t.contains('scrap') ||
+                 t.contains('write-off') || t.contains('write off') || t.contains('報廢') || t.contains('报废') ||
+                 t.contains('處置') || t.contains('处置') || t.contains('處分') || t.contains('处分');
+        }
+        final isDisposal = hasDisposalKeyword(tag) || hasDisposalKeyword(from) || hasDisposalKeyword(to) || hasDisposalKeyword(details);
+        if (isDisposal) {
+          disposalData = await _fetchDisposalByOldAssetCode(oldAssetCode, _selectedDb);
+        }
+      }
+    }
+
     if (!mounted) return;
     setState(() {
       final currentDbMap = Map<String, Map<String, dynamic>?>.from(_assetByDb[_selectedDb] ?? {});
       currentDbMap[code] = data;
       _assetByDb[_selectedDb] = currentDbMap;
+
+      if (data != null && disposalData != null) {
+        final oldAssetCode = data['Old Asset Code']?.toString();
+        if (oldAssetCode != null) {
+          final disposalMap = Map<String, Map<String, dynamic>?>.from(_disposalByDb[_selectedDb] ?? {});
+          disposalMap[oldAssetCode] = disposalData;
+          _disposalByDb[_selectedDb] = disposalMap;
+        }
+      }
     });
     final found = data != null;
     if (!mounted) return;
@@ -809,6 +956,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     setState(() {
       _scanHistory = [];
       _scanHistoryDb = [];
+      // 同步清空 chip 狀態
+      _chipPageIndexByCode.clear();
+      _chipDragDxByCode.clear();
     });
   }
 
@@ -830,10 +980,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kPreferredDbKey, db);
-    // Reorder successfulDbs so that the newly selected db is prioritized next time
     final current = prefs.getStringList(_kSuccessfulDbsKey) ?? List<String>.from(widget.availableDatabases);
     final reordered = <String>[db, ...current.where((e) => e != db)];
     await prefs.setStringList(_kSuccessfulDbsKey, reordered);
+    // 切換資料庫後，非同步建立索引
+    _ensureIndexesForDb(db);
   }
 
   Future<void> _openSettings() async {
@@ -979,9 +1130,32 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         final receiverStr = data == null ? '-' : (data['receiver']?.toString() ?? '-');
                         final details = data == null ? '-' : (data['Details']?.toString() ?? '-');
                         final tag = data == null ? '-' : (data['Tag']?.toString() ?? '-');
-                        // disposal 標紅（不分大小寫）
-                        final isDisposal = tag.toLowerCase().contains('disposal');
+                        // disposal 判斷：擴大多關鍵字、多欄位（Tag/From/To/Details），避免資料來源差異導致無法辨識
+                        bool hasDisposalKeyword(String s) {
+                          final t = s.toLowerCase();
+                          return t.contains('disposal') ||
+                                 t.contains('dispose') ||
+                                 t.contains('scrap') ||
+                                 t.contains('write-off') || t.contains('write off') ||
+                                 t.contains('報廢') || t.contains('报废') ||
+                                 t.contains('處置') || t.contains('处置') ||
+                                 t.contains('處分') || t.contains('处分');
+                        }
+                        final isDisposal = hasDisposalKeyword(tag) ||
+                                           hasDisposalKeyword(from) ||
+                                           hasDisposalKeyword(to) ||
+                                           hasDisposalKeyword(details);
                         final tagColor = isDisposal ? Colors.red : Colors.white;
+
+                        // 取得 disposal 詳細資訊
+                        Map<String, dynamic>? disposalInfo;
+                        if (isDisposal && data != null) {
+                          final oldAssetCode = data['Old Asset Code']?.toString();
+                          if (oldAssetCode != null && oldAssetCode.isNotEmpty && oldAssetCode != '-') {
+                            disposalInfo = _disposalByDb[dbForEntry]?[oldAssetCode];
+                          }
+                        }
+
                         return Align(
                           alignment: Alignment.centerLeft,
                           child: Container(
@@ -990,7 +1164,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                               color: Colors.teal.shade700,
                               borderRadius: BorderRadius.circular(16),
                             ),
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
@@ -1016,22 +1190,40 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                                       ),
                                       child: Text(
                                         _formatDbDisplay(dbForEntry),
-                                        style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
+                                        style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600),
                                       ),
                                     ),
                                   ],
                                 ),
-                                const SizedBox(height: 6),
-                                Text('From: $from', style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                Text('To: $to', style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                Text('When: $whenStr', style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                Text('Old Asset Code: $oldAsset', style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                Text('New Asset Code: $newAsset', style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                Text('SN: $sn', style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                Text('operator: $operatorStr', style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                Text('receiver: $receiverStr', style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                Text('Details: $details', style: const TextStyle(color: Colors.white, fontSize: 14)),
-                                Text('Tag: $tag', style: TextStyle(color: tagColor, fontSize: 14)),
+                                const SizedBox(height: 4),
+                                // 修改為 Tag: onsite 或 Tag: disposal 格式（移至 Details 下方）
+                                Text('From: $from', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                Text('To: $to', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                Text('When: $whenStr', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                Text('Old Asset Code: $oldAsset', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                Text('New Asset Code: $newAsset', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                Text('SN: $sn', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                Text('operator: $operatorStr', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                Text('receiver: $receiverStr', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                Text('Details: $details', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                Text('Tag: ${isDisposal ? 'disposal' : 'onsite'}', style: TextStyle(color: tagColor, fontSize: 13)),
+                                
+                                // 如果是 disposal 且有詳細資訊，顯示 disposal_list 的內容
+                                if (isDisposal && disposalInfo != null) ...[
+                                  const SizedBox(height: 8),
+                                  const Divider(color: Colors.white38, thickness: 1),
+                                  const SizedBox(height: 4),
+                                  const Text('Disposal Info:', style: TextStyle(color: Colors.redAccent, fontSize: 14, fontWeight: FontWeight.bold)),
+                                  const SizedBox(height: 4),
+                                  Text('When: ${_formatWhen(disposalInfo['When'])}', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                  Text('Old Asset Code: ${disposalInfo['Old Asset Code']?.toString() ?? '-'}', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                  Text('operator: ${disposalInfo['operator']?.toString() ?? '-'}', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                  Text('Location: ${disposalInfo['Location']?.toString() ?? '-'}', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                  Text('SN: ${disposalInfo['SN']?.toString() ?? '-'}', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                  Text('Details: ${disposalInfo['Details']?.toString() ?? '-'}', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                ],
+                                
+                                // 底部粗體 disposal 與 "why disposal?" 已依需求移除
                               ],
                             ),
                           ),
@@ -1348,7 +1540,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   TextField(
                     controller: _dbsCtrl,
                     decoration: const InputDecoration(
-                      hintText: 'db1,db2,db3',
+                      hintText: 'e.g. db1,db2,db3',
                       border: OutlineInputBorder(),
                     ),
                   ),

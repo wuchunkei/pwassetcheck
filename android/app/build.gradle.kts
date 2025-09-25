@@ -1,15 +1,12 @@
-// 将 app 模块的构建目录重定向到无空格路径，规避 Windows 路径空格问题
-val appNoSpaceBuildDir = file("C:/AndroidBuilds/FixAssetCheck/app/build")
-layout.buildDirectory.set(appNoSpaceBuildDir)
-@Suppress("UnstableApiUsage")
-buildDir = appNoSpaceBuildDir
-
 plugins {
     id("com.android.application")
     id("kotlin-android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
+
+
+buildDir = file("C:/dev/gradle_build/app")
 
 android {
     namespace = "com.example.fix_asset_check"
@@ -28,12 +25,13 @@ android {
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.example.fix_asset_check"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        // 版本來自 pubspec.yaml：`version: x.y.z+build`
+        // flutter.versionName / flutter.versionCode 由 Flutter Gradle 插件填充
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // NDK 需要 minSdk >= 21
+        minSdk = maxOf(21, flutter.minSdkVersion)
+        targetSdk = flutter.targetSdkVersion
     }
 
     buildTypes {

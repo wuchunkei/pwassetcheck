@@ -43,3 +43,11 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Ignore local Flutter SDKs and heavy build artifacts
+/flutter/
+/flutter_sdk/
+/android/build/
+/android/app/build/
+/android/wrapper/
+/dist/
